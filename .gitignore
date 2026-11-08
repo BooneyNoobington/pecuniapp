@@ -1,0 +1,4 @@
+WORKBOOK.md
+.build/
+.swiftpm/
+.DS_Store
