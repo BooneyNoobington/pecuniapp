@@ -28,44 +28,44 @@ MUTANTS = [
     ("An edit doesn't go past the value it replaces (no per-field clock)", "Device.swift", [
         ("return max(now, newest == .max ? newest : newest + 1)", "_ = newest; return now"),
     ]),
-    ("The last entry to arrive wins, instead of the newest", "Database.swift", [
-        ("current.stamp >= stamp {", "current.stamp >= stamp, false {"),
+    ("The last entry to arrive wins, instead of the newest", "Store.swift", [
+        ("current.stamp >= stamp\n            {", "current.stamp >= stamp, false\n            {"),
     ]),
     ("Ties aren't broken by device ID and number", "ChangeEntry.swift", [
         ("if lhs.device != rhs.device { return lhs.device < rhs.device }\n        return lhs.seq < rhs.seq",
          "return false"),
     ]),
     ("A split in a device's history isn't noticed", "Sync.swift", [
-        ("hasSplit = database.logs[id]?[Int(server) - 1].stored != newest", "hasSplit = false"),
-        ("hasSplit = overlap.first != database.logs[id]?[Int(local) - 1].stored",
-         "_ = overlap; hasSplit = false"),
+        ("hasSplit = try store.read { try $0.logEntry(id, seq: server)?.stored } != newest",
+         "hasSplit = false"),
+        ("hasSplit = overlap.first != mine", "_ = (overlap, mine); hasSplit = false"),
     ]),
     ("A split only notices when the server is behind", "Sync.swift", [
-        ("hasSplit = overlap.first != database.logs[id]?[Int(local) - 1].stored",
-         "_ = overlap; hasSplit = false"),
+        ("hasSplit = overlap.first != mine", "_ = (overlap, mine); hasSplit = false"),
     ]),
     ("A split only notices when the server is ahead", "Sync.swift", [
-        ("hasSplit = database.logs[id]?[Int(server) - 1].stored != newest", "hasSplit = false"),
+        ("hasSplit = try store.read { try $0.logEntry(id, seq: server)?.stored } != newest",
+         "hasSplit = false"),
     ]),
     ("Entries on this side of a split are dropped, not re-issued", "Sync.swift", [
-        ("orphans += (database.logs[id] ?? [])[split...].compactMap(\\.decoded)", "_ = split"),
+        ("orphans += local[Self.firstDifference(local, whole)...].compactMap(\\.decoded)", "_ = local"),
     ]),
     ("A re-issued entry gets the current time instead of its original one", "Sync.swift", [
         ("time: entry.time,", "time: environment.now(),"),
     ]),
     ("Entries don't name the one before them", "Device.swift", [
-        ("id: newEntryID(),\n            previous: database.logs[me]?.last?.decoded?.id,",
-         'id: "x",\n            previous: database.high(me) == 0 ? nil : "x",'),
+        ("id: newEntryID(),\n            previous: seq > 1 ? try tx.logEntry(me, seq: seq - 1)?.decoded?.id : nil,",
+         'id: "x",\n            previous: seq > 1 ? "x" : nil,'),
     ]),
     ("The chain isn't checked when pulling", "Sync.swift", [
         ("guard !canCheckLink || entry.previous == previous else {", "guard true else {"),
     ]),
     ("A split doesn't work the tables out again", "Sync.swift", [
-        ("            recalculateTables()\n            for orphan in orphans {",
-         "            for orphan in orphans {"),
+        ("                try tx.recalculateTables(supportedSchema: supportedSchema)\n                for orphan in orphans {",
+         "                for orphan in orphans {"),
     ]),
     ("Devices only upload their own entries", "Sync.swift", [
-        ("for id in database.knownDevices.keys.sorted() where !mustNotUpload.contains(id) {",
+        ("for id in known.keys.sorted() where !mustNotUpload.contains(id) {",
          "for id in [me] where !mustNotUpload.contains(id) {"),
     ]),
     ("A restored copy keeps its ID", "Sync.swift", [
@@ -75,17 +75,17 @@ MUTANTS = [
         ("guard stored.seq == next + 1, stored.device == id else {", "guard stored.device == id else {"),
     ]),
     ("A write during a sync isn't accounted for", "Sync.swift", [
-        ("if database.high(me) != myHighAtStart, isRolledBackCopy || splitLogs[me] != nil {",
-         "if false, database.high(me) != myHighAtStart, isRolledBackCopy || splitLogs[me] != nil {"),
+        ("if try tx.high(me) != myHighAtStart, isRolledBackCopy || splitLogs[me] != nil {",
+         "if false, try tx.high(me) != myHighAtStart, isRolledBackCopy || splitLogs[me] != nil {"),
     ]),
     ("Pushes aren't split into batches", "Sync.swift", [
-        ("let end = min(sent + UInt64(backend.maxBatchSize), local)", "let end = local"),
+        ("let end = min(index + backend.maxBatchSize, pending.count)", "let end = pending.count"),
     ]),
     ("Other devices aren't registered again after the server loses them", "Sync.swift", [
         ("            if !registered.contains(id) {\n                try await backend.registerDevice(\n"
-         "                    DeviceRecord(id: id, encryptedName: database.knownDevices[id] ?? Data()))\n"
-         "                registered.insert(id)\n            }\n            while sent < local {",
-         "            while sent < local {"),
+         "                    DeviceRecord(id: id, encryptedName: known[id] ?? Data()))\n"
+         "                registered.insert(id)\n            }\n            var index = 0",
+         "            var index = 0"),
     ]),
     ("An unrepairable split still uploads on top", "Sync.swift", [
         ("                    mustNotUpload.insert(id)\n                }\n            } else if server > local {",
@@ -98,39 +98,41 @@ MUTANTS = [
         ("                    report.problems.append(.unreadableEntry(device: id, seq: stored.seq))\n                    return fetched",
          "                    report.problems.append(.unreadableEntry(device: id, seq: stored.seq))\n                    next = stored.seq; continue"),
     ]),
-    ("Entries from a newer app version are applied anyway", "Database.swift", [
-        ("if let decoded, decoded.schema <= supportedSchema {\n            Self.apply(decoded, to: &tables)",
-         "if let decoded {\n            Self.apply(decoded, to: &tables)"),
-    ]),
-    ("Updating the app doesn't apply what was held back", "Device.swift", [
-        ("        database.tables = database.rebuiltTables(supportedSchema: supportedSchema)\n", ""),
-    ]),
     ("The clock warning never shows", "Sync.swift", [
         ("report.clockLooksWrong = offset.magnitude > clockWarningThreshold.magnitude",
          "report.clockLooksWrong = false"),
     ]),
+    ("Entries from a newer app version are applied anyway", "Store.swift", [
+        ("if let decoded, decoded.schema <= supportedSchema {\n            try apply(decoded)",
+         "if let decoded {\n            try apply(decoded)"),
+    ]),
+    ("Updating the app doesn't apply what was held back", "Device.swift", [
+        ("            try $0.recalculateTables(supportedSchema: supportedSchema)\n        }",
+         "            _ = ($0, supportedSchema)\n        }"),
+    ]),
     ("Restoring a record doesn't clear its deleted date", "Device.swift", [
-        ("try write(table, record, [Database.deletedAt: .null])",
-         "try write(table, record, [Database.deletedAt: .int(1)])"),
+        ("try write(table, record, [Self.deletedAt: .null])",
+         "try write(table, record, [Self.deletedAt: .int(1)])"),
     ]),
     ("The Keychain check is ignored", "Device.swift", [
-        ("if database.deviceID != stored {", "if database.deviceID == nil {"),
+        ("if case .found(let id) = stored, try tx.deviceID() == id {",
+         "if case .found = stored, try tx.deviceID() != nil {"),
     ]),
     ("A locked Keychain is treated as missing", "Device.swift", [
-        ("throw DeviceError.identityStoreLocked", "takeNewDeviceID()"),
+        ("throw DeviceError.identityStoreLocked", "_ = stored"),
     ]),
     ("Deleting wipes the record's other fields", "Device.swift", [
-        ("try write(table, record, [Database.deletedAt: .int(environment.now())])",
-         "var fields: [String: FieldValue] = [:]; for name in database.record(record, in: table)?.keys ?? [:].keys { fields[name] = .null }; fields[Database.deletedAt] = .int(environment.now()); try write(table, record, fields)"),
+        ("try write(table, record, [Self.deletedAt: .int(environment.now())])",
+         "var fields: [String: FieldValue] = [:]; for name in try self.record(record, in: table)?.keys ?? [:].keys { fields[name] = .null }; fields[Self.deletedAt] = .int(environment.now()); try write(table, record, fields)"),
     ]),
     ("A merge keeps whichever record it was shown first", "Duplicates.swift", [
         ("low = min(first, second)\n        high = max(first, second)", "low = first\n        high = second"),
     ]),
     ("A merge loses fields only the other record had", "Duplicates.swift", [
-        ("        if !missing.isEmpty {\n            try write(Self.transactions, pair.low, missing)\n        }\n", ""),
+        ("            if !missing.isEmpty {\n                try writeEntry(tx, table: Self.transactions, record: pair.low, fields: missing)\n            }\n", ""),
     ]),
     ("A dismissal doesn't hide the pair", "Duplicates.swift", [
-        ("if !isDismissed(pair) {", "if true {"),
+        ("if try !Self.isDismissed(pair, in: tx) {", "if true {"),
     ]),
     ("A conflicting recipient doesn't rule out a duplicate", "Duplicates.swift", [
         ("return firstRecipient.isNull || secondRecipient.isNull || firstRecipient == secondRecipient",
@@ -145,6 +147,23 @@ MUTANTS = [
     ("Floating-point amounts are accepted", "ChangeEntry.swift", [
         ("        } else if let value = try? container.decode(Int64.self) {\n            self = .int(value)\n",
          "        } else if let value = try? container.decode(Double.self) {\n            self = .int(Int64(value))\n"),
+    ]),
+    ("A failed write in memory isn't rolled back", "StoreSnapshot.swift", [
+        ("        let access = MemoryAccess(data)\n        let result = try body(access)\n        data = access.data\n        return result",
+         "        let access = MemoryAccess(data)\n        defer { data = access.data }\n        return try body(access)"),
+    ]),
+    ("SQLite writes aren't one transaction", "SQLiteStore.swift", [
+        ("try writer.write { db in try body(SQLiteAccess(db: db, codec: codec)) }",
+         "try writer.writeWithoutTransaction { db in try body(SQLiteAccess(db: db, codec: codec)) }"),
+    ]),
+    ("An entry is accepted out of order", "Store.swift", [
+        ("guard try high(stored.device) + 1 == stored.seq else {", "guard true else {"),
+    ]),
+    ("SQLite stores a boolean as an integer", "SQLiteStore.swift", [
+        ("case .bool(let flag): (kind, value) = (1, flag ? 1 : 0)", "case .bool(let flag): (kind, value) = (2, flag ? 1 : 0)"),
+    ]),
+    ("SQLite forgets the device ID", "SQLiteStore.swift", [
+        ("VALUES ('device_id', ?)", "VALUES ('another_key', ?)"),
     ]),
 ]
 

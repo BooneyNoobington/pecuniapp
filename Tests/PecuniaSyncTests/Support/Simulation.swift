@@ -95,6 +95,8 @@ final class Simulation {
         /// Simulates an identity check that can't tell a copy from the original, as if the
         /// Keychain moved with the backup. Used to show what that check protects against.
         var keychainMovesWithBackup = false
+        /// Which kind of local store the devices use.
+        var storeKind: StoreKind = .memory
         /// These narrow down which kind of event a failure depends on.
         var restoresDevicesFromBackups = true
         var restoresBackupsOntoNewDevices = true
@@ -102,7 +104,7 @@ final class Simulation {
     }
 
     struct DeviceBackup {
-        var database: Database
+        var database: StoreSnapshot
         var keychain: DeviceID?
         var held: Set<ContentKey>
         var scanned: [DeviceID: ScanPosition]
@@ -142,12 +144,12 @@ final class Simulation {
     init(seed: UInt64, options: Options = Options()) throws {
         self.seed = seed
         self.options = options
-        world = World(seed: seed)
+        world = World(seed: seed, storeKind: options.storeKind)
         world.server.maxBatchSize = pick([1, 3, 10, 50])
         world.server.maxPageSize = pick([1, 7, 200])
         connectionFailurePercent = pick([0, 1, 6])
         for _ in 0..<(2 + number(below: 3)) {
-            _ = try addDevice(database: Database(), keychain: InMemoryKeychain())
+            _ = try addDevice(database: StoreSnapshot(), keychain: InMemoryKeychain())
         }
     }
 
@@ -215,7 +217,7 @@ final class Simulation {
         SimulationFailure(seed: seed, step: step, reason: reason, trace: trace)
     }
 
-    private func addDevice(database: Database, keychain: InMemoryKeychain) throws -> TestDevice {
+    private func addDevice(database: StoreSnapshot, keychain: InMemoryKeychain) throws -> TestDevice {
         nameCounter += 1
         let device = try world.makeDevice(
             "device-\(nameCounter)", database: database, keychain: keychain,
@@ -239,11 +241,12 @@ final class Simulation {
         case ..<860:
             setClock(of: device)
         case ..<890:
+            let snapshot = try device.device.snapshot()
             device.backups.append(
                 DeviceBackup(
-                    database: device.database, keychain: device.keychain.stored, held: device.held,
+                    database: snapshot, keychain: device.keychain.stored, held: device.held,
                     scanned: device.scanned))
-            log("\(device.name) makes a backup at \(device.database.high(device.id))")
+            log("\(device.name) makes a backup at \(snapshot.high(device.id))")
         case ..<905:
             if options.restoresDevicesFromBackups {
                 try restoreOwnBackup(on: device)
@@ -254,7 +257,7 @@ final class Simulation {
             }
         case ..<930:
             if liveDevices.count < options.maxDevices {
-                let joined = try addDevice(database: Database(), keychain: InMemoryKeychain())
+                let joined = try addDevice(database: StoreSnapshot(), keychain: InMemoryKeychain())
                 log("\(joined.name) joins with an empty database")
             }
         case ..<938:
@@ -279,7 +282,7 @@ final class Simulation {
             }
         case ..<984:
             newestSchema = 2
-            device.device.appUpdated(toSchema: 2)
+            try device.device.appUpdated(toSchema: 2)
             stats.appUpdates += 1
             log("\(device.name) updates the app to schema 2")
         default:
@@ -314,7 +317,7 @@ final class Simulation {
         device.scanned = backup.scanned
         try device.restore(backup.database)
         stats.devicesRestored += 1
-        log("\(device.name) is restored from its backup at \(device.database.high(device.id))")
+        log("\(device.name) is restored from its backup at \(backup.database.high(device.id))")
     }
 
     private func restoreBackupOntoNewDevice(from device: TestDevice) throws {
@@ -389,7 +392,7 @@ final class Simulation {
             stats.newDeviceIDs += 1
             log("\(device.name) took a new device ID")
         }
-        scanHeldEntries(of: device)
+        try scanHeldEntries(of: device)
     }
 
     // MARK: Writing
@@ -397,7 +400,7 @@ final class Simulation {
     private func write(on device: TestDevice) throws {
         let app = device.device
         let table = Device.transactions
-        let live = app.database.liveRecords(in: table).keys.sorted()
+        let live = try app.liveRecords(in: table).keys.sorted()
 
         switch number(below: 100) {
         case ..<32:
@@ -419,7 +422,7 @@ final class Simulation {
             switch number(below: 4) {
             case 0: edit = ["amount": pick(amounts)]
             case 1: edit = ["note": .string("note \(number(below: 1000))")]
-            case 2: edit = ["category": .string(categoryReference())]
+            case 2: edit = ["category": .string(try categoryReference())]
             default: edit = ["amount": pick(amounts), "recipient": pick(recipients)]
             }
             try checkedWrite(on: device, table, record, edit)
@@ -431,9 +434,8 @@ final class Simulation {
             log("\(device.name) deletes \(record)")
             stats.writes += 1
         case ..<80:
-            let deleted = (app.database.tables[table] ?? [:]).keys.sorted().filter {
-                app.database.isDeleted($0, in: table)
-            }
+            let deleted = try app.store.read { try $0.records(in: table) }
+                .filter { Device.isDeleted($0.value) }.keys.sorted()
             guard !deleted.isEmpty else { return }
             let record = pick(deleted)
             try app.restore(table, record)
@@ -446,35 +448,35 @@ final class Simulation {
                 try checkedWrite(
                     on: device, "subscription_versions",
                     .subscriptionVersion(subscription: subscription, validFrom: date),
-                    ["amount": pick(amounts), Database.deletedAt: .null])
+                    ["amount": pick(amounts), Device.deletedAt: .null])
             } else {
                 try checkedWrite(
                     on: device, "subscription_overrides",
                     .subscriptionOverride(subscription: subscription, occurrence: date),
-                    ["amount": pick(amounts), Database.deletedAt: .null])
+                    ["amount": pick(amounts), Device.deletedAt: .null])
             }
         case ..<96:
-            let pairs = app.possibleDuplicates()
+            let pairs = try app.possibleDuplicates()
             guard !pairs.isEmpty else { return }
             let pair = pick(pairs)
             try app.mergeDuplicates(pair)
             stats.merges += 1
             log("\(device.name) merges \(pair.low) and \(pair.high)")
         default:
-            let pairs = app.possibleDuplicates()
+            let pairs = try app.possibleDuplicates()
             guard !pairs.isEmpty else { return }
             let pair = pick(pairs)
             try app.dismissDuplicates(pair)
             stats.dismissals += 1
             log("\(device.name) dismisses \(pair.low) and \(pair.high)")
         }
-        scanHeldEntries(of: device)
+        try scanHeldEntries(of: device)
     }
 
     /// A reference that may point at a category this device hasn't received yet.
-    private func categoryReference() -> String {
-        let source = pick(liveDevices).database
-        let categories = (source.tables["categories"] ?? [:]).keys.sorted()
+    private func categoryReference() throws -> String {
+        let source = pick(liveDevices).device
+        let categories = try source.store.read { try $0.records(in: "categories") }.keys.sorted()
         return categories.isEmpty ? "no-such-category" : pick(categories).rawValue
     }
 
@@ -485,13 +487,13 @@ final class Simulation {
         _ record: RecordID,
         _ fields: [String: FieldValue]
     ) throws {
-        let before = fields.keys.compactMap { field in
-            device.database.state(of: field, record: record, table: table).map { (field, $0.stamp) }
+        let before = try fields.keys.compactMap { field in
+            try device.device.state(of: field, record: record, table: table).map { (field, $0.stamp) }
         }
         let entry = try device.device.write(table, record, fields)
         stats.writes += 1
         for (field, value) in fields {
-            guard device.database.value(of: field, record: record, table: table) == value else {
+            guard try device.device.value(of: field, record: record, table: table) == value else {
                 throw failure("\(device.name) can't read back its own write to \(field)")
             }
         }
@@ -504,17 +506,23 @@ final class Simulation {
 
     /// Remembers everything this device has held since its last rollback. All of it must still
     /// exist on every remaining device at the end, or something was lost.
-    private func scanHeldEntries(of device: TestDevice) {
-        for (id, log) in device.database.logs {
-            var from = 0
-            if let position = device.scanned[id], position.count <= log.count,
-                position.count == 0 || log[position.count - 1].stored == position.last {
-                from = position.count
+    private func scanHeldEntries(of device: TestDevice) throws {
+        try device.device.store.read { tx in
+            for id in Set(try tx.knownDevices().keys).union(device.scanned.keys) {
+                let high = try tx.high(id)
+                var from: UInt64 = 0
+                if let position = device.scanned[id], UInt64(position.count) <= high,
+                    try position.count == 0
+                        || tx.logEntry(id, seq: UInt64(position.count))?.stored == position.last
+                {
+                    from = UInt64(position.count)
+                }
+                for entry in try tx.logEntries(id, after: from) {
+                    device.held.insert(Self.contentKey(of: entry))
+                }
+                device.scanned[id] = ScanPosition(
+                    count: Int(high), last: try tx.logEntry(id, seq: high)?.stored)
             }
-            for entry in log[from...] {
-                device.held.insert(Self.contentKey(of: entry))
-            }
-            device.scanned[id] = ScanPosition(count: log.count, last: log.last?.stored)
         }
     }
 
@@ -529,7 +537,7 @@ final class Simulation {
         let live = liveDevices
         for device in live {
             device.isOnline = true
-            device.device.appUpdated(toSchema: newestSchema)
+            try device.device.appUpdated(toSchema: newestSchema)
         }
 
         // Keep syncing, with no failures any more, until a whole round moves nothing.
@@ -548,7 +556,7 @@ final class Simulation {
                 guard report.problems.isEmpty else {
                     throw failure("\(device.name) reported \(report.problems) at the end")
                 }
-                scanHeldEntries(of: device)
+                try scanHeldEntries(of: device)
                 stats.splitLogsRepaired += report.splitLogsRepaired
                 stats.reissuedEntries += report.reissuedEntries
                 moved += report.pulledEntries + report.pushedEntries + report.splitLogsRepaired
@@ -580,10 +588,12 @@ final class Simulation {
     private func checkConvergence(of live: [TestDevice]) throws {
         let codec = EntryCodec()
         let first = live[0]
+        let snapshots = try live.map { try $0.device.snapshot() }
+        let firstSnapshot = snapshots[0]
 
         // All devices hold exactly the same tables and logs...
-        for device in live.dropFirst() {
-            if let difference = Self.firstDifference(first.database, device.database) {
+        for (device, snapshot) in zip(live, snapshots).dropFirst() {
+            if let difference = Self.firstDifference(firstSnapshot, snapshot) {
                 throw failure("\(first.name) and \(device.name) differ: \(difference)")
             }
         }
@@ -591,13 +601,13 @@ final class Simulation {
         // ...so the rest only needs checking on one of them. Rebuilding from the log must give
         // the tables.
         guard
-            first.database.rebuiltTables(supportedSchema: first.device.supportedSchema)
-                == first.database.tables
+            firstSnapshot.rebuiltTables(supportedSchema: first.device.supportedSchema)
+                == firstSnapshot.tables
         else { throw failure("\(first.name) tables don't match its own log") }
 
         // Numbers have no gaps, every payload decodes to what's recorded, and every entry follows
         // the one before it.
-        for (id, log) in first.database.logs {
+        for (id, log) in firstSnapshot.logs {
             var previous: String?
             for (index, entry) in log.enumerated() {
                 guard entry.stored.device == id, entry.stored.seq == UInt64(index) + 1 else {
@@ -614,7 +624,7 @@ final class Simulation {
         }
 
         // The server holds the full log.
-        for (id, log) in first.database.logs {
+        for (id, log) in firstSnapshot.logs {
             guard world.server.entries(of: id) == log.map(\.stored) else {
                 throw failure("the server's log of \(id) doesn't match the devices'")
             }
@@ -626,14 +636,14 @@ final class Simulation {
             everHeld.formUnion(device.held)
         }
         let remaining = Set(
-            first.database.logs.values.joined().map { Self.contentKey(of: $0) })
+            firstSnapshot.logs.values.joined().map { Self.contentKey(of: $0) })
         let lost = everHeld.subtracting(remaining)
         guard lost.isEmpty else {
             throw failure("\(lost.count) writes were lost, for example \(lost.first!)")
         }
     }
 
-    private static func firstDifference(_ first: Database, _ second: Database) -> String? {
+    private static func firstDifference(_ first: StoreSnapshot, _ second: StoreSnapshot) -> String? {
         // A difference in the logs is the cause of any difference in the tables, so look there first.
         for id in Set(first.logs.keys).union(second.logs.keys).sorted() {
             let firstLog = first.logs[id] ?? []

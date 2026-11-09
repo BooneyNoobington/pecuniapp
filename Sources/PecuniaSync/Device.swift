@@ -41,9 +41,11 @@ public struct DeviceEnvironment {
     }
 }
 
-/// One device's view of the data: its database plus the rules for changing and syncing it.
+/// One device's view of the data: its local store plus the rules for changing and syncing it.
 public final class Device {
-    public internal(set) var database: Database
+    public static let deletedAt = "deleted_at"
+
+    public let store: any LocalStore
     public internal(set) var supportedSchema: Int
     /// How far a clock may differ from the server's before the sync status warns about it.
     public var clockWarningThreshold: Int64 = 3_600_000
@@ -55,13 +57,13 @@ public final class Device {
     var isSyncing = false
 
     public init(
-        database: Database = Database(),
+        store: any LocalStore = MemoryStore(),
         identity: any DeviceIdentityStore,
         environment: DeviceEnvironment = .system,
         name: String,
         supportedSchema: Int = 1
     ) {
-        self.database = database
+        self.store = store
         self.identity = identity
         self.environment = environment
         self.name = name
@@ -73,23 +75,100 @@ public final class Device {
     /// Must run on launch, before any write. If the ID in the Keychain doesn't match the one in
     /// the database, the database is a copy, so this device takes an ID of its own.
     public func open() throws {
-        switch identity.read() {
-        case .locked:
+        let stored = identity.read()
+        if stored == .locked {
             throw DeviceError.identityStoreLocked
-        case .found(let stored):
-            if database.deviceID != stored {
-                takeNewDeviceID()
+        }
+        let newID: DeviceID? = try store.write { tx in
+            if case .found(let id) = stored, try tx.deviceID() == id {
+                return nil
             }
-        case .missing:
-            takeNewDeviceID()
+            return try takeNewDeviceID(tx)
+        }
+        if let newID {
+            identity.write(newID)
         }
     }
 
-    func takeNewDeviceID() {
+    /// Records a new ID in the database. The caller puts it in the identity store once the
+    /// transaction has been saved, so a failed transaction can't leave the two out of step.
+    func takeNewDeviceID(_ tx: any StoreAccess) throws -> DeviceID {
         let id = DeviceID.random(environment.random)
-        database.deviceID = id
-        database.knownDevices[id] = Data(name.utf8)
-        identity.write(id)
+        try tx.setDeviceID(id)
+        try tx.setKnownDevice(id, encryptedName: Data(name.utf8))
+        return id
+    }
+
+    // MARK: Reading
+
+    public func deviceID() throws -> DeviceID? {
+        try store.read { try $0.deviceID() }
+    }
+
+    public func state(of field: String, record: RecordID, table: String) throws -> FieldState? {
+        try store.read { try $0.fieldState(field, record: record, table: table) }
+    }
+
+    public func value(of field: String, record: RecordID, table: String) throws -> FieldValue? {
+        try state(of: field, record: record, table: table)?.value
+    }
+
+    /// A record's fields whether it's deleted or not, or nil if it hasn't arrived here.
+    public func record(_ id: RecordID, in table: String) throws -> [String: FieldValue]? {
+        try store.read { try $0.fields(of: id, table: table)?.mapValues(\.value) }
+    }
+
+    public func isDeleted(_ id: RecordID, in table: String) throws -> Bool {
+        try store.read { try Self.isDeleted($0.fields(of: id, table: table) ?? [:]) }
+    }
+
+    public func liveRecords(in table: String) throws -> [RecordID: [String: FieldValue]] {
+        try store.read { try Self.liveRecords($0.records(in: table)) }
+    }
+
+    /// Every value a field has held, oldest first. An overwritten value stays here for good.
+    public func history(of field: String, record: RecordID, table: String) throws -> [FieldState] {
+        try store.read {
+            try Self.history(
+                of: field, record: record, table: table,
+                in: $0.logEntries(table: table, record: record))
+        }
+    }
+
+    /// How many entries are stored but can't be applied until the app is updated.
+    public func heldBackCount() throws -> Int {
+        try store.read { [supportedSchema] in try $0.heldBackCount(supportedSchema: supportedSchema) }
+    }
+
+    public func snapshot() throws -> StoreSnapshot {
+        try store.snapshot()
+    }
+
+    static func isDeleted(_ fields: [String: FieldState]) -> Bool {
+        guard let deleted = fields[deletedAt] else { return false }
+        return !deleted.value.isNull
+    }
+
+    static func liveRecords(
+        _ records: [RecordID: [String: FieldState]]
+    ) -> [RecordID: [String: FieldValue]] {
+        records.filter { !isDeleted($0.value) }.mapValues { $0.mapValues(\.value) }
+    }
+
+    static func history(
+        of field: String,
+        record: RecordID,
+        table: String,
+        in entries: some Sequence<LogEntry>
+    ) -> [FieldState] {
+        var versions: [FieldState] = []
+        for entry in entries {
+            guard let decoded = entry.decoded, decoded.table == table, decoded.record == record,
+                let value = decoded.fields[field]
+            else { continue }
+            versions.append(FieldState(value: value, stamp: decoded.stamp))
+        }
+        return versions.sorted { $0.stamp < $1.stamp }
     }
 
     // MARK: Writing
@@ -101,61 +180,80 @@ public final class Device {
         _ record: RecordID,
         _ fields: [String: FieldValue]
     ) throws -> ChangeEntry {
-        guard database.deviceID != nil else { throw DeviceError.notOpen }
         guard !fields.isEmpty else { throw DeviceError.nothingToWrite }
-        return try appendEntry(
+        return try store.write { tx in
+            try writeEntry(tx, table: table, record: record, fields: fields)
+        }
+    }
+
+    /// Writes fields inside a transaction that's already open, so several writes can be one.
+    @discardableResult
+    func writeEntry(
+        _ tx: any StoreAccess,
+        table: String,
+        record: RecordID,
+        fields: [String: FieldValue]
+    ) throws -> ChangeEntry {
+        try appendEntry(
+            tx,
             table: table,
             record: record,
             fields: fields,
-            time: writeTime(table: table, record: record, fields: fields.keys),
+            time: writeTime(tx, table: table, record: record, fields: fields.keys),
             schema: supportedSchema
         )
+    }
+
+    /// The current time or just past the values being overwritten, whichever is later, so an
+    /// edit always beats what it replaces even if this device's clock is wrong.
+    private func writeTime(
+        _ tx: any StoreAccess,
+        table: String,
+        record: RecordID,
+        fields: some Collection<String>
+    ) throws -> Int64 {
+        let now = environment.now()
+        var newest: Int64?
+        for field in fields {
+            if let time = try tx.fieldState(field, record: record, table: table)?.stamp.time {
+                newest = max(newest ?? time, time)
+            }
+        }
+        guard let newest else { return now }
+        return max(now, newest == .max ? newest : newest + 1)
     }
 
     /// Adds an entry to the end of this device's own log and applies it.
     @discardableResult
     func appendEntry(
+        _ tx: any StoreAccess,
         table: String,
         record: RecordID,
         fields: [String: FieldValue],
         time: Int64,
         schema: Int
     ) throws -> ChangeEntry {
-        guard let me = database.deviceID else { throw DeviceError.notOpen }
+        guard let me = try tx.deviceID() else { throw DeviceError.notOpen }
+        let seq = try tx.high(me) + 1
         let entry = ChangeEntry(
             format: ChangeEntry.currentFormat,
             schema: schema,
             device: me,
-            seq: database.high(me) + 1,
+            seq: seq,
             id: newEntryID(),
-            previous: database.logs[me]?.last?.decoded?.id,
+            previous: seq > 1 ? try tx.logEntry(me, seq: seq - 1)?.decoded?.id : nil,
             table: table,
             record: record,
             fields: fields,
             time: time
         )
-        let stored = StoredEntry(device: me, seq: entry.seq, payload: try codec.encode(entry))
-        database.append(stored, decoded: entry, supportedSchema: supportedSchema)
+        let stored = StoredEntry(device: me, seq: seq, payload: try codec.encode(entry))
+        try tx.append(stored, decoded: entry, supportedSchema: supportedSchema)
         return entry
     }
 
     private func newEntryID() -> String {
         String(environment.random(), radix: 16)
-    }
-
-    /// The current time or just past the values being overwritten, whichever is later, so an
-    /// edit always beats what it replaces even if this device's clock is wrong.
-    private func writeTime(
-        table: String,
-        record: RecordID,
-        fields: Dictionary<String, FieldValue>.Keys
-    ) -> Int64 {
-        let now = environment.now()
-        let newest = fields.compactMap {
-            database.state(of: $0, record: record, table: table)?.stamp.time
-        }.max()
-        guard let newest else { return now }
-        return max(now, newest == .max ? newest : newest + 1)
     }
 
     @discardableResult
@@ -167,31 +265,20 @@ public final class Device {
 
     /// Marks a record as deleted. It's an ordinary field, so an edit elsewhere doesn't undo it.
     public func delete(_ table: String, _ record: RecordID) throws {
-        try write(table, record, [Database.deletedAt: .int(environment.now())])
+        try write(table, record, [Self.deletedAt: .int(environment.now())])
     }
 
     public func restore(_ table: String, _ record: RecordID) throws {
-        try write(table, record, [Database.deletedAt: .null])
+        try write(table, record, [Self.deletedAt: .null])
     }
 
     // MARK: App updates
 
     /// Applies what was held back for this version.
-    public func appUpdated(toSchema schema: Int) {
+    public func appUpdated(toSchema schema: Int) throws {
         supportedSchema = max(supportedSchema, schema)
-        recalculateTables()
-    }
-
-    /// Works the tables out from the log again, for when the log itself has changed.
-    func recalculateTables() {
-        database.tables = database.rebuiltTables(supportedSchema: supportedSchema)
-        var heldBack = 0
-        for log in database.logs.values {
-            for entry in log {
-                if let decoded = entry.decoded, decoded.schema <= supportedSchema { continue }
-                heldBack += 1
-            }
+        try store.write { [supportedSchema] in
+            try $0.recalculateTables(supportedSchema: supportedSchema)
         }
-        database.heldBackCount = heldBack
     }
 }

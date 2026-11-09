@@ -18,31 +18,35 @@ extension Device {
     /// Records with the same account and amount, dated within a day of each other and with no
     /// conflicting recipient. Sync can't remove these itself, since you may really have bought
     /// two coffees that morning, so they're only ever suggested.
-    public func possibleDuplicates() -> [DuplicatePair] {
-        struct Key: Hashable {
-            var account: FieldValue
-            var amount: FieldValue
-        }
+    public func possibleDuplicates() throws -> [DuplicatePair] {
+        try store.read { tx in
+            struct Key: Hashable {
+                var account: FieldValue
+                var amount: FieldValue
+            }
 
-        var groups: [Key: [(id: RecordID, fields: [String: FieldValue])]] = [:]
-        for (id, fields) in database.liveRecords(in: Self.transactions) {
-            guard let account = fields["account"], let amount = fields["amount"] else { continue }
-            groups[Key(account: account, amount: amount), default: []].append((id, fields))
-        }
+            var groups: [Key: [(id: RecordID, fields: [String: FieldValue])]] = [:]
+            for (id, fields) in Self.liveRecords(try tx.records(in: Self.transactions)) {
+                guard let account = fields["account"], let amount = fields["amount"] else {
+                    continue
+                }
+                groups[Key(account: account, amount: amount), default: []].append((id, fields))
+            }
 
-        var pairs: [DuplicatePair] = []
-        for group in groups.values where group.count > 1 {
-            for (index, first) in group.enumerated() {
-                for second in group[(index + 1)...]
-                where Self.mayBeSamePurchase(first.fields, second.fields) {
-                    let pair = DuplicatePair(first.id, second.id)
-                    if !isDismissed(pair) {
-                        pairs.append(pair)
+            var pairs: [DuplicatePair] = []
+            for group in groups.values where group.count > 1 {
+                for (index, first) in group.enumerated() {
+                    for second in group[(index + 1)...]
+                    where Self.mayBeSamePurchase(first.fields, second.fields) {
+                        let pair = DuplicatePair(first.id, second.id)
+                        if try !Self.isDismissed(pair, in: tx) {
+                            pairs.append(pair)
+                        }
                     }
                 }
             }
+            return pairs.sorted { ($0.low, $0.high) < ($1.low, $1.high) }
         }
-        return pairs.sorted { ($0.low, $0.high) < ($1.low, $1.high) }
     }
 
     private static func mayBeSamePurchase(
@@ -75,30 +79,35 @@ extension Device {
         return era * 146_097 + dayOfEra - 719_468
     }
 
-    private func isDismissed(_ pair: DuplicatePair) -> Bool {
+    private static func isDismissed(_ pair: DuplicatePair, in tx: any StoreAccess) throws -> Bool {
         let id = RecordID.duplicateDismissal(low: pair.low, high: pair.high)
-        return database.record(id, in: Self.duplicateDismissals) != nil
-            && !database.isDeleted(id, in: Self.duplicateDismissals)
+        guard let fields = try tx.fields(of: id, table: duplicateDismissals) else { return false }
+        return !isDeleted(fields)
     }
 
     /// Always keeps the record with the lowest ID, so two devices merging the same pair make the
     /// same choice. If each kept the record it was showing, each could delete the other's choice
     /// and the purchase would disappear. Empty fields on the kept record are filled in first.
+    /// It's one transaction, so a merge never stops halfway.
     public func mergeDuplicates(_ pair: DuplicatePair) throws {
-        guard let kept = database.record(pair.low, in: Self.transactions),
-            let other = database.record(pair.high, in: Self.transactions)
-        else { return }
+        try store.write { tx in
+            guard let kept = try tx.fields(of: pair.low, table: Self.transactions),
+                let other = try tx.fields(of: pair.high, table: Self.transactions)
+            else { return }
 
-        var missing: [String: FieldValue] = [:]
-        for (name, value) in other where name != Database.deletedAt && !value.isNull {
-            if kept[name]?.isNull ?? true {
-                missing[name] = value
+            var missing: [String: FieldValue] = [:]
+            for (name, state) in other where name != Self.deletedAt && !state.value.isNull {
+                if kept[name]?.value.isNull ?? true {
+                    missing[name] = state.value
+                }
             }
+            if !missing.isEmpty {
+                try writeEntry(tx, table: Self.transactions, record: pair.low, fields: missing)
+            }
+            try writeEntry(
+                tx, table: Self.transactions, record: pair.high,
+                fields: [Self.deletedAt: .int(environment.now())])
         }
-        if !missing.isEmpty {
-            try write(Self.transactions, pair.low, missing)
-        }
-        try delete(Self.transactions, pair.high)
     }
 
     public func dismissDuplicates(_ pair: DuplicatePair) throws {
@@ -108,7 +117,7 @@ extension Device {
             [
                 "low": .string(pair.low.rawValue),
                 "high": .string(pair.high.rawValue),
-                Database.deletedAt: .null,
+                Self.deletedAt: .null,
             ]
         )
     }

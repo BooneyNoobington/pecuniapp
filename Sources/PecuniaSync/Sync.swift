@@ -58,13 +58,13 @@ extension Device {
     /// transaction, then uploads go out. If the connection dies at any point, nothing is lost
     /// and the next round works out from scratch what's still missing.
     public func sync(using backend: any SyncBackend) async throws -> SyncReport {
-        guard var me = database.deviceID else { throw DeviceError.notOpen }
         guard !isSyncing else { throw DeviceError.alreadySyncing }
         isSyncing = true
         defer { isSyncing = false }
+        guard var me = try deviceID() else { throw DeviceError.notOpen }
 
         var report = SyncReport()
-        let myHighAtStart = database.high(me)
+        let myHighAtStart = try store.read { try $0.high(me) }
 
         if let serverTime = try await backend.serverTime() {
             let offset = environment.now() &- serverTime
@@ -72,10 +72,14 @@ extension Device {
             report.clockLooksWrong = offset.magnitude > clockWarningThreshold.magnitude
         }
 
+        // Remember every device the server knows about, whatever happens later in this sync.
         let listed = try await backend.listDevices()
         var registered = Set(listed.map(\.id))
-        for device in listed {
-            database.knownDevices[device.id] = device.encryptedName
+        var known = try store.write { tx in
+            for device in listed {
+                try tx.setKnownDevice(device.id, encryptedName: device.encryptedName)
+            }
+            return try tx.knownDevices()
         }
 
         // Compare each device's log with the server's. Each entry names the one before it, so if
@@ -87,19 +91,20 @@ extension Device {
         var mustNotUpload = Set<DeviceID>()
         var isRolledBackCopy = false
 
-        for id in database.knownDevices.keys.sorted() {
+        for id in known.keys.sorted() {
             let newest = try await backend.newestEntry(of: id)
             let server = newest?.seq ?? 0
-            let local = database.high(id)
+            let local = try store.read { try $0.high(id) }
             serverHigh[id] = server
             guard let newest else { continue }
 
             let hasSplit: Bool
             if server <= local {
-                hasSplit = database.logs[id]?[Int(server) - 1].stored != newest
+                hasSplit = try store.read { try $0.logEntry(id, seq: server)?.stored } != newest
             } else if local > 0 {
                 let overlap = try await backend.pull(device: id, after: local - 1, limit: 1)
-                hasSplit = overlap.first != database.logs[id]?[Int(local) - 1].stored
+                let mine = try store.read { try $0.logEntry(id, seq: local)?.stored }
+                hasSplit = overlap.first != mine
             } else {
                 hasSplit = false
             }
@@ -125,75 +130,86 @@ extension Device {
             }
         }
 
-        // You may have entered something while this was going on. That's fine unless this device's
-        // own log is about to change, because the comparison is then out of date. The next round
-        // starts over with the new entries included.
-        if database.high(me) != myHighAtStart, isRolledBackCopy || splitLogs[me] != nil {
-            return report
-        }
-
-        // An entry from a newer format can't be re-issued, so a split involving one has to wait
-        // until the app is updated. Nothing is lost in the meantime.
-        for (id, whole) in splitLogs {
-            let tail = database.logs[id]?[firstDifference(in: id, from: whole)...]
-            if tail?.contains(where: { $0.decoded == nil }) == true {
-                mustNotUpload.insert(id)
-                splitLogs[id] = nil
-                report.updateRequired = true
-            }
-        }
-
         // Apply everything in one transaction.
-        if isRolledBackCopy || splitLogs[me] != nil {
-            takeNewDeviceID()
-            me = database.deviceID!
-            report.tookNewDeviceID = true
-        }
-        var orphans: [ChangeEntry] = []
-        for (id, whole) in splitLogs.sorted(by: { $0.key < $1.key }) {
-            let split = firstDifference(in: id, from: whole)
-            orphans += (database.logs[id] ?? [])[split...].compactMap(\.decoded)
-            database.logs[id] = whole.map { LogEntry(stored: $0.stored, decoded: $0.decoded) }
-            report.splitLogsRepaired += 1
-        }
-        for (id, entries) in newEntries.sorted(by: { $0.key < $1.key }) where splitLogs[id] == nil {
-            for entry in entries {
-                database.append(
-                    entry.stored, decoded: entry.decoded, supportedSchema: supportedSchema)
+        var newID: DeviceID?
+        let applied = try store.write { tx -> Bool in
+            // You may have entered something while this was going on. That's fine unless this
+            // device's own log is about to change, because the comparison is then out of date.
+            // The next round starts over with the new entries included.
+            if try tx.high(me) != myHighAtStart, isRolledBackCopy || splitLogs[me] != nil {
+                return false
             }
-            report.pulledEntries += entries.count
-        }
-        if !splitLogs.isEmpty {
-            recalculateTables()
-            for orphan in orphans {
-                try reissue(orphan)
+
+            // An entry from a newer format can't be re-issued, so a split involving one has to
+            // wait until the app is updated. Nothing is lost in the meantime.
+            for (id, whole) in splitLogs {
+                let local = try tx.logEntries(id, after: 0)
+                if local[Self.firstDifference(local, whole)...].contains(where: { $0.decoded == nil }) {
+                    mustNotUpload.insert(id)
+                    splitLogs[id] = nil
+                    report.updateRequired = true
+                }
             }
-            report.reissuedEntries = orphans.count
+
+            if isRolledBackCopy || splitLogs[me] != nil {
+                me = try takeNewDeviceID(tx)
+                newID = me
+                report.tookNewDeviceID = true
+            }
+            var orphans: [ChangeEntry] = []
+            for (id, whole) in splitLogs.sorted(by: { $0.key < $1.key }) {
+                let local = try tx.logEntries(id, after: 0)
+                orphans += local[Self.firstDifference(local, whole)...].compactMap(\.decoded)
+                try tx.replaceLog(
+                    of: id, with: whole.map { LogEntry(stored: $0.stored, decoded: $0.decoded) })
+                report.splitLogsRepaired += 1
+            }
+            for (id, entries) in newEntries.sorted(by: { $0.key < $1.key }) where splitLogs[id] == nil {
+                for entry in entries {
+                    try tx.append(entry.stored, decoded: entry.decoded, supportedSchema: supportedSchema)
+                }
+                report.pulledEntries += entries.count
+            }
+            if !splitLogs.isEmpty {
+                try tx.recalculateTables(supportedSchema: supportedSchema)
+                for orphan in orphans {
+                    try reissue(orphan, in: tx)
+                }
+                report.reissuedEntries = orphans.count
+            }
+            report.updateRequired =
+                try report.updateRequired || tx.heldBackCount(supportedSchema: supportedSchema) > 0
+            return true
         }
-        report.updateRequired = report.updateRequired || database.heldBackCount > 0
+        if let newID {
+            identity.write(newID)
+            known[newID] = Data(name.utf8)
+        }
+        guard applied else { return report }
 
         // Upload whatever the server lacks, for every device, not only this one. That way any
         // one remaining device can rebuild the whole log after the server loses data.
         if !registered.contains(me) {
             try await backend.registerDevice(
-                DeviceRecord(id: me, encryptedName: database.knownDevices[me] ?? Data()))
+                DeviceRecord(id: me, encryptedName: known[me] ?? Data(name.utf8)))
             registered.insert(me)
         }
-        for id in database.knownDevices.keys.sorted() where !mustNotUpload.contains(id) {
-            let log = database.logs[id] ?? []
-            let local = UInt64(log.count)
-            var sent = serverHigh[id, default: 0]
-            guard local > sent else { continue }
+        for id in known.keys.sorted() where !mustNotUpload.contains(id) {
+            let pending = try store.read { [serverHigh] in
+                try $0.logEntries(id, after: serverHigh[id, default: 0])
+            }
+            guard !pending.isEmpty else { continue }
             if !registered.contains(id) {
                 try await backend.registerDevice(
-                    DeviceRecord(id: id, encryptedName: database.knownDevices[id] ?? Data()))
+                    DeviceRecord(id: id, encryptedName: known[id] ?? Data()))
                 registered.insert(id)
             }
-            while sent < local {
-                let end = min(sent + UInt64(backend.maxBatchSize), local)
-                try await backend.push(log[Int(sent)..<Int(end)].map(\.stored))
-                report.pushedEntries += Int(end - sent)
-                sent = end
+            var index = 0
+            while index < pending.count {
+                let end = min(index + backend.maxBatchSize, pending.count)
+                try await backend.push(pending[index..<end].map(\.stored))
+                report.pushedEntries += end - index
+                index = end
             }
         }
         return report
@@ -209,7 +225,7 @@ extension Device {
     ) async throws -> [Fetched] {
         var fetched: [Fetched] = []
         var next = start
-        var previous = start == 0 ? nil : database.logs[id]?[Int(start) - 1].decoded?.id
+        var previous = start == 0 ? nil : try store.read { try $0.logEntry(id, seq: start)?.decoded?.id }
         // An entry in a newer format can't be read, so the link after it can't be checked.
         var canCheckLink = start == 0 || previous != nil
         while next < target {
@@ -247,9 +263,8 @@ extension Device {
         return fetched
     }
 
-    /// The index of the first entry where this device's log and the server's differ.
-    private func firstDifference(in id: DeviceID, from server: [Fetched]) -> Int {
-        let local = database.logs[id] ?? []
+    /// The index of the first entry where a device's local log and the server's differ.
+    private static func firstDifference(_ local: [LogEntry], _ server: [Fetched]) -> Int {
         var index = 0
         while index < local.count, index < server.count, local[index].stored == server[index].stored {
             index += 1
@@ -259,8 +274,9 @@ extension Device {
 
     /// Gives an entry that only exists on this side of a split a new place in this device's log.
     /// It keeps its time, so it still beats whatever it was written on top of.
-    private func reissue(_ entry: ChangeEntry) throws {
+    private func reissue(_ entry: ChangeEntry, in tx: any StoreAccess) throws {
         try appendEntry(
+            tx,
             table: entry.table,
             record: entry.record,
             fields: entry.fields,

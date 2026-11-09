@@ -37,6 +37,12 @@ final class InMemoryKeychain: DeviceIdentityStore {
     }
 }
 
+/// Which kind of local store test devices use.
+enum StoreKind: String, Sendable, CaseIterable {
+    case memory
+    case sqlite
+}
+
 /// Real time and shared randomness for a group of test devices.
 final class World {
     static let start: Int64 = 1_793_000_000_000
@@ -46,15 +52,31 @@ final class World {
     var time = World.start
     var rng: SeededRNG
     let server = InMemoryServer()
+    let storeKind: StoreKind
 
-    init(seed: UInt64 = 1) {
+    init(seed: UInt64 = 1, storeKind: StoreKind = .memory) {
         rng = SeededRNG(seed: seed)
+        self.storeKind = storeKind
         server.clock = { [unowned self] in self.time }
+    }
+
+    /// A new store holding the same as a snapshot, as restoring a backup does.
+    func makeStore(from snapshot: StoreSnapshot) throws -> any LocalStore {
+        switch storeKind {
+        case .memory:
+            return MemoryStore(snapshot)
+        case .sqlite:
+            #if canImport(GRDB)
+            return try SQLiteStore.inMemory(copying: snapshot)
+            #else
+            preconditionFailure("SQLite is only available on Apple platforms")
+            #endif
+        }
     }
 
     func makeDevice(
         _ name: String,
-        database: Database = Database(),
+        database: StoreSnapshot = StoreSnapshot(),
         keychain: InMemoryKeychain = InMemoryKeychain(),
         supportedSchema: Int = 1
     ) throws -> TestDevice {
@@ -107,7 +129,7 @@ final class TestDevice {
     init(
         name: String,
         world: World,
-        database: Database,
+        database: StoreSnapshot,
         keychain: InMemoryKeychain,
         supportedSchema: Int
     ) throws {
@@ -116,8 +138,8 @@ final class TestDevice {
         self.keychain = keychain
         self.clock = Clock(world: world)
         self.device = Self.makeDevice(
-            name: name, world: world, clock: clock, database: database, keychain: keychain,
-            supportedSchema: supportedSchema)
+            name: name, world: world, clock: clock, store: try world.makeStore(from: database),
+            keychain: keychain, supportedSchema: supportedSchema)
         try device.open()
     }
 
@@ -125,12 +147,12 @@ final class TestDevice {
         name: String,
         world: World,
         clock: Clock,
-        database: Database,
+        store: any LocalStore,
         keychain: InMemoryKeychain,
         supportedSchema: Int
     ) -> Device {
         Device(
-            database: database,
+            store: store,
             identity: keychain,
             environment: DeviceEnvironment(
                 now: { clock.now },
@@ -141,19 +163,33 @@ final class TestDevice {
         )
     }
 
-    var id: DeviceID { device.database.deviceID! }
-    var database: Database { device.database }
+    var id: DeviceID { try! device.deviceID()! }
+
+    /// A copy of everything the device holds. Cheap in memory, but slow with SQLite, so the
+    /// simulation's frequent reads go to the store directly instead.
+    var database: StoreSnapshot { (try? device.snapshot()) ?? StoreSnapshot() }
 
     /// Replaces the database with a backup, as restoring the whole device does.
-    func restore(_ backup: Database) throws {
+    func restore(_ backup: StoreSnapshot) throws {
         device = Self.makeDevice(
-            name: name, world: world, clock: clock, database: backup, keychain: keychain,
-            supportedSchema: device.supportedSchema)
+            name: name, world: world, clock: clock, store: try world.makeStore(from: backup),
+            keychain: keychain, supportedSchema: device.supportedSchema)
         try device.open()
     }
 
     @discardableResult
     func sync() async throws -> SyncReport {
         try await device.sync(using: world.server)
+    }
+}
+
+extension StoreKind {
+    /// The kinds this platform can run. SQLite isn't available on Linux.
+    static var available: [StoreKind] {
+        #if canImport(GRDB)
+        return [.memory, .sqlite]
+        #else
+        return [.memory]
+        #endif
     }
 }

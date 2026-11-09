@@ -35,13 +35,13 @@ struct MergingTests {
         let entries = randomEntries(seed: seed, count: 60)
         var expected: Tables = [:]
         for entry in entries {
-            Database.apply(entry, to: &expected)
+            StoreSnapshot.apply(entry, to: &expected)
         }
         var rng = SeededRNG(seed: seed &+ 1000)
         for _ in 0..<20 {
             var tables: Tables = [:]
             for entry in entries.shuffled(using: &rng) {
-                Database.apply(entry, to: &tables)
+                StoreSnapshot.apply(entry, to: &tables)
             }
             #expect(tables == expected)
         }
@@ -53,9 +53,9 @@ struct MergingTests {
         var once: Tables = [:]
         var twice: Tables = [:]
         for entry in entries {
-            Database.apply(entry, to: &once)
-            Database.apply(entry, to: &twice)
-            Database.apply(entry, to: &twice)
+            StoreSnapshot.apply(entry, to: &once)
+            StoreSnapshot.apply(entry, to: &twice)
+            StoreSnapshot.apply(entry, to: &twice)
         }
         #expect(once == twice)
     }

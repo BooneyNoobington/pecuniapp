@@ -42,8 +42,8 @@ struct WhatHappensWhenTests {
 
     private let table = Device.transactions
 
-    private func phoneAndIMac() throws -> (World, TestDevice, TestDevice) {
-        let world = World()
+    private func phoneAndIMac(_ storeKind: StoreKind) throws -> (World, TestDevice, TestDevice) {
+        let world = World(storeKind: storeKind)
         return (world, try world.makeDevice("phone"), try world.makeDevice("iMac"))
     }
 
@@ -62,9 +62,9 @@ struct WhatHappensWhenTests {
             })
     }
 
-    @Test("You enter different things on your phone and your iMac")
-    func differentThings() async throws {
-        let (world, phone, imac) = try phoneAndIMac()
+    @Test("You enter different things on your phone and your iMac", arguments: StoreKind.available)
+    func differentThings(storeKind: StoreKind) async throws {
+        let (world, phone, imac) = try phoneAndIMac(storeKind)
         let croissant = try phone.device.create(table, ["amount": -250])
         let salary = try imac.device.create(table, ["amount": 300_000])
 
@@ -77,9 +77,9 @@ struct WhatHappensWhenTests {
         expectSame(phone, imac)
     }
 
-    @Test("You change the amount on one device and the category on another")
-    func differentFields() async throws {
-        let (world, phone, imac) = try phoneAndIMac()
+    @Test("You change the amount on one device and the category on another", arguments: StoreKind.available)
+    func differentFields(storeKind: StoreKind) async throws {
+        let (world, phone, imac) = try phoneAndIMac(storeKind)
         let record = try phone.device.create(table, ["amount": -250, "category": "food"])
         try await world.syncAll([phone, imac])
 
@@ -97,9 +97,9 @@ struct WhatHappensWhenTests {
         expectSame(phone, imac)
     }
 
-    @Test("You change the same field on two devices")
-    func sameField() async throws {
-        let (world, phone, imac) = try phoneAndIMac()
+    @Test("You change the same field on two devices", arguments: StoreKind.available)
+    func sameField(storeKind: StoreKind) async throws {
+        let (world, phone, imac) = try phoneAndIMac(storeKind)
         let record = try phone.device.create(table, ["note": "original"])
         try await world.syncAll([phone, imac])
 
@@ -122,9 +122,9 @@ struct WhatHappensWhenTests {
         expectSame(phone, imac)
     }
 
-    @Test("You delete a record on one device and edit it on another")
-    func deleteAndEdit() async throws {
-        let (world, phone, imac) = try phoneAndIMac()
+    @Test("You delete a record on one device and edit it on another", arguments: StoreKind.available)
+    func deleteAndEdit(storeKind: StoreKind) async throws {
+        let (world, phone, imac) = try phoneAndIMac(storeKind)
         let record = try phone.device.create(table, ["amount": -250, "note": "keep me"])
         try await world.syncAll([phone, imac])
 
@@ -147,9 +147,9 @@ struct WhatHappensWhenTests {
         expectSame(phone, imac)
     }
 
-    @Test("Two devices enter a price change or override for the same subscription and date")
-    func samePriceChange() async throws {
-        let (world, phone, imac) = try phoneAndIMac()
+    @Test("Two devices enter a price change or override for the same subscription and date", arguments: StoreKind.available)
+    func samePriceChange(storeKind: StoreKind) async throws {
+        let (world, phone, imac) = try phoneAndIMac(storeKind)
         let subscription = RecordID(rawValue: "electricity")
 
         let version = RecordID.subscriptionVersion(subscription: subscription, validFrom: "2026-12-01")
@@ -171,9 +171,9 @@ struct WhatHappensWhenTests {
         expectSame(phone, imac)
     }
 
-    @Test("You enter the same expense on both devices")
-    func sameExpense() async throws {
-        let (world, phone, imac) = try phoneAndIMac()
+    @Test("You enter the same expense on both devices", arguments: StoreKind.available)
+    func sameExpense(storeKind: StoreKind) async throws {
+        let (world, phone, imac) = try phoneAndIMac(storeKind)
         let coffee: [String: FieldValue] = ["account": "cash", "amount": -350, "date": "2026-11-06"]
         let first = try phone.device.create(table, coffee)
         let second = try imac.device.create(table, coffee)
@@ -185,35 +185,38 @@ struct WhatHappensWhenTests {
 
         // Sync can't tell, so both are kept and only shown as possible duplicates.
         #expect(phone.database.liveRecords(in: table).count == 3)
-        #expect(phone.device.possibleDuplicates() == [DuplicatePair(first, second)])
-        #expect(imac.device.possibleDuplicates() == [DuplicatePair(first, second)])
+        #expect(try phone.device.possibleDuplicates() == [DuplicatePair(first, second)])
+        #expect(try imac.device.possibleDuplicates() == [DuplicatePair(first, second)])
 
         // A conflicting recipient rules it out.
         try phone.device.write(table, first, ["recipient": "bakery"])
         try imac.device.write(table, second, ["recipient": "supermarket"])
-        #expect(phone.device.possibleDuplicates() == [DuplicatePair(first, second)])
+        #expect(try phone.device.possibleDuplicates() == [DuplicatePair(first, second)])
         try await world.syncAll([phone, imac])
-        #expect(phone.device.possibleDuplicates().isEmpty)
+        #expect(try phone.device.possibleDuplicates().isEmpty)
         try phone.device.write(table, second, ["recipient": "bakery"])
 
         // Dismissing it syncs like everything else, and both stay.
-        #expect(phone.device.possibleDuplicates() == [DuplicatePair(first, second)])
+        #expect(try phone.device.possibleDuplicates() == [DuplicatePair(first, second)])
         try phone.device.dismissDuplicates(DuplicatePair(first, second))
         try await world.syncAll([phone, imac])
-        #expect(phone.device.possibleDuplicates().isEmpty)
-        #expect(imac.device.possibleDuplicates().isEmpty)
+        #expect(try phone.device.possibleDuplicates().isEmpty)
+        #expect(try imac.device.possibleDuplicates().isEmpty)
         #expect(imac.database.liveRecords(in: table).count == 3)
         expectSame(phone, imac)
     }
 
-    @Test("You merge the same duplicate on two devices")
-    func mergeOnBoth() async throws {
-        let (world, phone, imac) = try phoneAndIMac()
+    @Test("You merge the same duplicate on two devices", arguments: StoreKind.available)
+    func mergeOnBoth(storeKind: StoreKind) async throws {
+        let (world, phone, imac) = try phoneAndIMac(storeKind)
         let coffee: [String: FieldValue] = ["account": "cash", "amount": -350, "date": "2026-11-06"]
         let first = try phone.device.create(table, coffee)
-        var withRecipient = coffee
-        withRecipient["recipient"] = "bakery"
-        let second = try imac.device.create(table, withRecipient)
+        let second = try imac.device.create(table, coffee)
+
+        // Only the record the merge will delete knows the recipient, so the merge has to copy it.
+        let pair = DuplicatePair(first, second)
+        let deviceWithDeletedRecord = pair.high == first ? phone : imac
+        try deviceWithDeletedRecord.device.write(table, pair.high, ["recipient": "bakery"])
         try await world.syncAll([phone, imac])
 
         // Each device starts from the record it happens to be showing.
@@ -227,13 +230,13 @@ struct WhatHappensWhenTests {
         #expect(live.count == 1)
         #expect(live.keys.first == min(first, second))
         #expect(live.values.first?["recipient"] == "bakery")
-        #expect(phone.device.possibleDuplicates().isEmpty)
+        #expect(try phone.device.possibleDuplicates().isEmpty)
         expectSame(phone, imac)
     }
 
-    @Test("The merge can't delete all of three copies of a purchase")
-    func mergeThree() async throws {
-        let (world, phone, imac) = try phoneAndIMac()
+    @Test("The merge can't delete all of three copies of a purchase", arguments: StoreKind.available)
+    func mergeThree(storeKind: StoreKind) async throws {
+        let (world, phone, imac) = try phoneAndIMac(storeKind)
         let coffee: [String: FieldValue] = ["account": "cash", "amount": -350, "date": "2026-11-06"]
         let ids = try [
             phone.device.create(table, coffee),
@@ -250,9 +253,9 @@ struct WhatHappensWhenTests {
         expectSame(phone, imac)
     }
 
-    @Test("The connection dies during a push")
-    func connectionDies() async throws {
-        let (world, phone, imac) = try phoneAndIMac()
+    @Test("The connection dies during a push", arguments: StoreKind.available)
+    func connectionDies(storeKind: StoreKind) async throws {
+        let (world, phone, imac) = try phoneAndIMac(storeKind)
         world.server.maxBatchSize = 2
         for amount in 1...5 {
             try phone.device.create(table, ["amount": .int(Int64(amount))])
@@ -290,9 +293,9 @@ struct WhatHappensWhenTests {
         expectSame(phone, imac)
     }
 
-    @Test("A device is restored from an old backup")
-    func restoredFromOldBackup() async throws {
-        let (world, phone, imac) = try phoneAndIMac()
+    @Test("A device is restored from an old backup", arguments: StoreKind.available)
+    func restoredFromOldBackup(storeKind: StoreKind) async throws {
+        let (world, phone, imac) = try phoneAndIMac(storeKind)
         for amount in 1...3 {
             try phone.device.create(table, ["amount": .int(Int64(amount))])
         }
@@ -325,9 +328,10 @@ struct WhatHappensWhenTests {
     /// The example from the design review: both are at 100, the old phone pushes up to 105,
     /// and the new phone has 108 locally, so the server's number isn't above the new phone's.
     private func copiedDeviceExample(
-        keychainMoves: Bool
+        keychainMoves: Bool,
+        storeKind: StoreKind
     ) async throws -> (old: TestDevice, new: TestDevice, imac: TestDevice, idAtStart: DeviceID) {
-        let world = World()
+        let world = World(storeKind: storeKind)
         let oldPhone = try world.makeDevice("old phone")
         let imac = try world.makeDevice("iMac")
         for amount in 1...100 {
@@ -351,9 +355,9 @@ struct WhatHappensWhenTests {
         return (oldPhone, newPhone, imac, idAtStart)
     }
 
-    @Test("You restore a backup onto a new device and keep using the old one")
-    func backupOntoNewDevice() async throws {
-        let (oldPhone, newPhone, imac, idAtStart) = try await copiedDeviceExample(keychainMoves: false)
+    @Test("You restore a backup onto a new device and keep using the old one", arguments: StoreKind.available)
+    func backupOntoNewDevice(storeKind: StoreKind) async throws {
+        let (oldPhone, newPhone, imac, idAtStart) = try await copiedDeviceExample(keychainMoves: false, storeKind: storeKind)
 
         // The Keychain doesn't move with a backup, so the new phone took its own ID right away.
         #expect(idAtStart != oldPhone.id)
@@ -362,10 +366,10 @@ struct WhatHappensWhenTests {
         expectSame(oldPhone, newPhone, imac)
     }
 
-    @Test("A copied device that keeps its ID is still repaired, with nothing lost")
-    func copiedDeviceKeepingItsID() async throws {
+    @Test("A copied device that keeps its ID is still repaired, with nothing lost", arguments: StoreKind.available)
+    func copiedDeviceKeepingItsID(storeKind: StoreKind) async throws {
         // Even if the identity check can't tell, comparing entries with the server reveals it.
-        let (oldPhone, newPhone, imac, idAtStart) = try await copiedDeviceExample(keychainMoves: true)
+        let (oldPhone, newPhone, imac, idAtStart) = try await copiedDeviceExample(keychainMoves: true, storeKind: storeKind)
 
         #expect(idAtStart == oldPhone.id)
         #expect(newPhone.id != idAtStart)
@@ -374,9 +378,9 @@ struct WhatHappensWhenTests {
         expectSame(oldPhone, newPhone, imac)
     }
 
-    @Test("You restore a device from a backup and enter something before it syncs")
-    func restoredThenWrites() async throws {
-        let (world, phone, imac) = try phoneAndIMac()
+    @Test("You restore a device from a backup and enter something before it syncs", arguments: StoreKind.available)
+    func restoredThenWrites(storeKind: StoreKind) async throws {
+        let (world, phone, imac) = try phoneAndIMac(storeKind)
         for amount in 1...3 {
             try phone.device.create(table, ["amount": .int(Int64(amount))])
         }
@@ -410,9 +414,9 @@ struct WhatHappensWhenTests {
         expectSame(phone, imac)
     }
 
-    @Test("A split is also repaired by devices holding the other side of it")
-    func splitSeenByOtherDevice() async throws {
-        let (world, phone, imac) = try phoneAndIMac()
+    @Test("A split is also repaired by devices holding the other side of it", arguments: StoreKind.available)
+    func splitSeenByOtherDevice(storeKind: StoreKind) async throws {
+        let (world, phone, imac) = try phoneAndIMac(storeKind)
         for amount in 1...3 {
             try phone.device.create(table, ["amount": .int(Int64(amount))])
         }
@@ -445,9 +449,9 @@ struct WhatHappensWhenTests {
     /// A rare case the simulation found about once in 25,000 runs, written out so that every test
     /// run covers it. Re-issuing an entry gives it the same content wherever it happens, so without
     /// the chain, two branches of a device's log could end in identical entries.
-    @Test("A split is noticed even when the newest entries say the same thing")
-    func splitBehindMatchingEntries() async throws {
-        let world = World()
+    @Test("A split is noticed even when the newest entries say the same thing", arguments: StoreKind.available)
+    func splitBehindMatchingEntries(storeKind: StoreKind) async throws {
+        let world = World(storeKind: storeKind)
         let phone = try world.makeDevice("phone")
         let imac = try world.makeDevice("iMac")
         let tablet = try world.makeDevice("tablet")
@@ -498,9 +502,9 @@ struct WhatHappensWhenTests {
         expectSame(tablet, phone, imac)
     }
 
-    @Test("The server is restored from an old backup")
-    func serverRestored() async throws {
-        let world = World()
+    @Test("The server is restored from an old backup", arguments: StoreKind.available)
+    func serverRestored(storeKind: StoreKind) async throws {
+        let world = World(storeKind: storeKind)
         let phone = try world.makeDevice("phone")
         let oldTablet = try world.makeDevice("old tablet")
         try phone.device.create(table, ["amount": 1])
@@ -540,9 +544,9 @@ struct WhatHappensWhenTests {
         #expect(another.database.tables == phone.database.tables)
     }
 
-    @Test("A device's clock is far in the future")
-    func clockInTheFuture() async throws {
-        let (world, phone, imac) = try phoneAndIMac()
+    @Test("A device's clock is far in the future", arguments: StoreKind.available)
+    func clockInTheFuture(storeKind: StoreKind) async throws {
+        let (world, phone, imac) = try phoneAndIMac(storeKind)
         let record = try imac.device.create(table, ["amount": -250, "note": "real time"])
         let untouched = try imac.device.create(table, ["amount": -100])
         try await world.syncAll([phone, imac])
@@ -604,9 +608,9 @@ struct WhatHappensWhenTests {
         expectSame(phone, imac)
     }
 
-    @Test("A change comes from a newer app version")
-    func newerAppVersion() async throws {
-        let world = World()
+    @Test("A change comes from a newer app version", arguments: StoreKind.available)
+    func newerAppVersion(storeKind: StoreKind) async throws {
+        let world = World(storeKind: storeKind)
         let phone = try world.makeDevice("phone", supportedSchema: 2)
         let imac = try world.makeDevice("iMac", supportedSchema: 1)
 
@@ -620,15 +624,15 @@ struct WhatHappensWhenTests {
         #expect(imac.database.record(record, in: table) == nil)
 
         // Updating applies it, including fields this version may not use yet.
-        imac.device.appUpdated(toSchema: 2)
+        try imac.device.appUpdated(toSchema: 2)
         #expect(imac.database.value(of: "new_in_v2", record: record, table: table) == "something")
         #expect(try await imac.sync().updateRequired == false)
         expectSame(phone, imac)
     }
 
-    @Test("An entry in a newer format is kept and uploaded again, even though it can't be read")
-    func newerFormat() async throws {
-        let (world, phone, imac) = try phoneAndIMac()
+    @Test("An entry in a newer format is kept and uploaded again, even though it can't be read", arguments: StoreKind.available)
+    func newerFormat(storeKind: StoreKind) async throws {
+        let (world, phone, imac) = try phoneAndIMac(storeKind)
         try await phone.sync()
         let payload = Data(#"{"format":99,"anything":"at all"}"#.utf8)
         world.server.forceInsert(StoredEntry(device: phone.id, seq: 1, payload: payload))
@@ -643,9 +647,9 @@ struct WhatHappensWhenTests {
         #expect(world.server.entries(of: phone.id).first?.payload == payload)
     }
 
-    @Test("A record refers to one that hasn't arrived yet")
-    func missingReference() async throws {
-        let world = World()
+    @Test("A record refers to one that hasn't arrived yet", arguments: StoreKind.available)
+    func missingReference(storeKind: StoreKind) async throws {
+        let world = World(storeKind: storeKind)
         let phone = try world.makeDevice("phone")
         let imac = try world.makeDevice("iMac")
         let tablet = try world.makeDevice("tablet")
